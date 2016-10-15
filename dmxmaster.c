@@ -3,7 +3,7 @@
 #include <libftdi1/ftdi.h>
 #include <unistd.h>
 #include <time.h>
-#include "periodic_timer.c"
+#include "sema.c"
 #define REPORT_INTERVAL 5
 #define DMX_FREQUENCY 43000
 #define DMX_BAUDRATE 250000
@@ -14,8 +14,10 @@ struct DmxOutput {
   int state;
   unsigned char universe[513];
   int universe_count;
+  int last_universe_count;
+  time_t last_report;
 };
-
+static struct rk_sema timer_sem;	
 
 void dmx_print_ftdi_version(struct DmxOutput *dmx) {
   dmx->version = ftdi_get_library_version();
@@ -51,6 +53,7 @@ void dmx_write_universe(struct DmxOutput *dmx){
   if (ret != 513) {
     printf("Writing universe failed");
   }
+  ((struct DmxOutput*)dmx)->universe_count += 1;
 }
 
 void dmx_cleanup(struct DmxOutput *dmx) {
@@ -67,13 +70,18 @@ void dmx_cleanup(struct DmxOutput *dmx) {
    free(dmx);
 }
 
-static void dmx_timer_func(void* dmx) 
-{
-  dmx_write_universe(dmx);
-	((struct DmxOutput*)dmx)->universe_count += 1;
-//  fflush( stdout );
+void dmx_report(struct DmxOutput *dmx) {
+  if (dmx->last_report == 0) {
+    dmx->last_report = time(NULL);
+  }
+  double elapsed = (double)(time(NULL) - dmx->last_report);
+  if (((int)elapsed) > REPORT_INTERVAL) {
+    float universes = (float)(dmx->universe_count - dmx->last_universe_count);
+    printf("Writing %.2f universes per second\n", universes / elapsed);
+    dmx->last_universe_count = dmx->universe_count;
+    dmx->last_report = time(NULL);
+  }
 }
-
 
 struct DmxOutput* dmx_new() {
   struct DmxOutput *dmx = malloc(sizeof(struct DmxOutput));
@@ -99,6 +107,21 @@ struct DmxOutput* dmx_new() {
   return dmx;
 }
 
+static void timersignalhandler()  {
+	rk_sem_post(&timer_sem);
+}
+
+
+void set_periodic_timer(long delay) {
+	rk_sem_init(&timer_sem, 0);
+	signal(SIGALRM, timersignalhandler);
+	struct itimerval tval = { 
+		/* subsequent firings */ .it_interval = { .tv_sec = 0, .tv_usec = delay }, 
+		/* first firing */       .it_value = { .tv_sec = 0, .tv_usec = delay }};
+
+	setitimer(ITIMER_REAL, &tval, (struct itimerval*)0);
+}
+
 int main(void) {
   struct DmxOutput* dmx;
  printf("**********************  DMX Master 1.0 **********************\n");
@@ -107,22 +130,13 @@ int main(void) {
     return EXIT_FAILURE;
   }
   printf("Timer init\n");
-  init_timer(dmx_timer_func, (void*)dmx);
 	set_periodic_timer(DMX_FREQUENCY);
-  
-  int last_universe_count = dmx->universe_count;
-  time_t last_count = time(NULL);
+  dmx->universe[1] = 255;
   while (TRUE) {
-    double elapsed = (double)(time(NULL) - last_count);
-    if (((int)elapsed) > REPORT_INTERVAL) {
-      float universes = (float)(dmx->universe_count - last_universe_count);
-      printf("Writing %.2f universes per second\n", universes / elapsed);
-      last_universe_count = dmx->universe_count;
-      last_count = time(NULL);
-    }
-    sleep(1);
+    dmx_write_universe(dmx);
+    dmx_report(dmx);
+    rk_sem_wait(&timer_sem);
   }
   dmx_cleanup(dmx);
-  shutdown_timer();
   return EXIT_SUCCESS;
 }
