@@ -7,6 +7,7 @@
 #define REPORT_INTERVAL 5
 #define DMX_FREQUENCY 43000
 #define DMX_BAUDRATE 250000
+#define DMX_OPEN_INTERVAL 5
 struct DmxOutput {
   struct ftdi_context *ftdi;
   struct ftdi_version_info version;
@@ -16,6 +17,7 @@ struct DmxOutput {
   int universe_count;
   int last_universe_count;
   time_t last_report;
+  time_t last_open;
 };
 static struct rk_sema timer_sem;	
 
@@ -28,7 +30,7 @@ void dmx_print_ftdi_version(struct DmxOutput *dmx) {
 
 int dmx_open(struct DmxOutput *dmx) {
   int ret;
-
+  dmx->last_open = time(NULL);
   if ((ret = ftdi_usb_open(dmx->ftdi, 0x0403, 0x6001)) < 0) {
     fprintf(stderr, "unable to open ftdi device: %d (%s)\n", ret,
       ftdi_get_error_string(dmx->ftdi));
@@ -45,16 +47,25 @@ int dmx_open(struct DmxOutput *dmx) {
       ftdi_get_error_string(dmx->ftdi));
     return EXIT_FAILURE;
   }
+  dmx->state += 1;
   return 0;
+}
+
+
+void dmx_reset(struct DmxOutput *dmx)  {
+  ftdi_usb_close(dmx->ftdi);
+  dmx->state = 1;
 }
 
 void dmx_write_universe(struct DmxOutput *dmx){
   int ret = ftdi_write_data(dmx->ftdi, dmx->universe, 513);
   if (ret != 513) {
-    printf("Writing universe failed");
+    printf("Writing universe failed, resetting device\n");
+    dmx_reset(dmx);
   }
   ((struct DmxOutput*)dmx)->universe_count += 1;
 }
+
 
 void dmx_cleanup(struct DmxOutput *dmx) {
   int ret;
@@ -83,6 +94,7 @@ void dmx_report(struct DmxOutput *dmx) {
   }
 }
 
+
 struct DmxOutput* dmx_new() {
   struct DmxOutput *dmx = malloc(sizeof(struct DmxOutput));
   if (dmx==NULL) return NULL;
@@ -95,16 +107,21 @@ struct DmxOutput* dmx_new() {
   dmx->state += 1;
   dmx_print_ftdi_version(dmx);
   if (dmx_open(dmx) != 0){
-    dmx_cleanup(dmx);
-    return NULL;
+    return dmx;
   }
-  dmx->state += 1;
   
   if (dmx->ftdi->type == TYPE_R) {
       ftdi_read_chipid(dmx->ftdi, &(dmx->ftdi_chipid));
       printf("FTDI chipid: %X\n", dmx->ftdi_chipid);
   }
   return dmx;
+}
+
+int dmx_check(struct DmxOutput* dmx) {
+  if (dmx->state == 1 && dmx->last_open + DMX_OPEN_INTERVAL < time(NULL)) {
+    dmx_open(dmx);
+  }
+  return dmx->state - 2;
 }
 
 static void timersignalhandler()  {
@@ -123,8 +140,8 @@ void set_periodic_timer(long delay) {
 }
 
 int main(void) {
-  struct DmxOutput* dmx;
- printf("**********************  DMX Master 1.0 **********************\n");
+  struct DmxOutput* dmx = NULL;
+  printf("**********************  DMX Master 1.0 **********************\n");
   if ((dmx = dmx_new()) == 0) {
     printf("Failed to initialize dmx device");
     return EXIT_FAILURE;
@@ -133,8 +150,10 @@ int main(void) {
 	set_periodic_timer(DMX_FREQUENCY);
   dmx->universe[1] = 255;
   while (TRUE) {
-    dmx_write_universe(dmx);
-    dmx_report(dmx);
+    if (dmx_check(dmx) == 0) {
+      dmx_write_universe(dmx);
+      dmx_report(dmx);
+    }
     rk_sem_wait(&timer_sem);
   }
   dmx_cleanup(dmx);
