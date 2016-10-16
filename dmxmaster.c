@@ -67,11 +67,22 @@ void dmx_reset(struct DmxOutput *dmx)  {
 }
 
 void dmx_write_universe(struct DmxOutput *dmx){
-  int ret = ftdi_write_data(dmx->ftdi, dmx->universe, 513);
+  int ret;
+  if ((ret = ftdi_set_line_property2(dmx->ftdi, BITS_8, STOP_BIT_2, NONE, BREAK_ON)) < 0) {
+    fprintf(stderr, "unable to set line properties on ftdi device: %d (%s)\n", ret,
+      ftdi_get_error_string(dmx->ftdi));
+  }
+  if ((ret = ftdi_set_line_property2(dmx->ftdi, BITS_8, STOP_BIT_2, NONE, BREAK_OFF)) < 0) {
+    fprintf(stderr, "unable to set line properties on ftdi device: %d (%s)\n", ret,
+      ftdi_get_error_string(dmx->ftdi));
+  }
+  ret = ftdi_write_data(dmx->ftdi, dmx->universe, 513);
+  
   if (ret != 513) {
     printf("Writing universe failed, resetting device\n");
     dmx_reset(dmx);
   }
+  
   ((struct DmxOutput*)dmx)->universe_count += 1;
 }
 
@@ -107,6 +118,7 @@ void dmx_report(struct DmxOutput *dmx) {
 
 struct DmxOutput* dmx_new() {
   struct DmxOutput *dmx = malloc(sizeof(struct DmxOutput));
+  memset(dmx->universe, 0, 513);
   if (dmx==NULL) return NULL;
   dmx->state = 0;
   if ((dmx->ftdi = ftdi_new()) == 0) {
