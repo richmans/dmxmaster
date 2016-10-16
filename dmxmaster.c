@@ -3,9 +3,14 @@
 #include <libftdi1/ftdi.h>
 #include <unistd.h>
 #include <time.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 #include "sema.c"
+#include <string.h>
+#define PORT 5120   //The port on which to listen for incoming data
+#define SIZE_OF_UNIVERSE 512
 #define REPORT_INTERVAL 5
-#define DMX_FREQUENCY 43000
+#define DMX_INTERVAL 43000
 #define DMX_BAUDRATE 250000
 #define DMX_OPEN_INTERVAL 5
 struct DmxOutput {
@@ -13,12 +18,16 @@ struct DmxOutput {
   struct ftdi_version_info version;
   unsigned int ftdi_chipid;
   int state;
-  unsigned char universe[513];
+  unsigned char universe[SIZE_OF_UNIVERSE + 1];
   int universe_count;
   int last_universe_count;
   time_t last_report;
   time_t last_open;
+  int socket;
+  int packet_count;
+  int last_packet_count;
 };
+
 static struct rk_sema timer_sem;	
 
 void dmx_print_ftdi_version(struct DmxOutput *dmx) {
@@ -88,12 +97,13 @@ void dmx_report(struct DmxOutput *dmx) {
   double elapsed = (double)(time(NULL) - dmx->last_report);
   if (((int)elapsed) > REPORT_INTERVAL) {
     float universes = (float)(dmx->universe_count - dmx->last_universe_count);
-    printf("Writing %.2f universes per second\n", universes / elapsed);
+    float packets = (float)(dmx->packet_count - dmx->last_packet_count);
+    printf("Writing %.2f universes, receiving %.2f packets per second\n", universes / elapsed, packets / elapsed);
     dmx->last_universe_count = dmx->universe_count;
+    dmx->last_packet_count = dmx->packet_count;
     dmx->last_report = time(NULL);
   }
 }
-
 
 struct DmxOutput* dmx_new() {
   struct DmxOutput *dmx = malloc(sizeof(struct DmxOutput));
@@ -139,6 +149,41 @@ void set_periodic_timer(long delay) {
 	setitimer(ITIMER_REAL, &tval, (struct itimerval*)0);
 }
 
+int udp_setup(struct DmxOutput* dmx) {
+  struct sockaddr_in si_me;
+  if ((dmx->socket = socket(AF_INET, SOCK_DGRAM,IPPROTO_UDP)) == -1) {
+    printf("Can't create socket\n");
+    return EXIT_FAILURE;
+  }
+  si_me.sin_family = AF_INET;
+  si_me.sin_port = htons(PORT);
+  si_me.sin_addr.s_addr = htonl(INADDR_ANY);
+  if ( bind(dmx->socket, (struct sockaddr*)&si_me, sizeof(si_me)) == -1){
+    printf("Can't bind socket\n");
+    return EXIT_FAILURE;
+  }
+  
+  set_non_blocking(dmx->socket);
+  printf("Server ready\n");
+  return EXIT_SUCCESS;
+}
+
+void udp_read(struct DmxOutput* dmx) {
+  unsigned char buf[SIZE_OF_UNIVERSE];
+  ssize_t bytes_avail = recv(dmx->socket, buf, SIZE_OF_UNIVERSE, MSG_PEEK);
+  while (bytes_avail > 0){
+    ssize_t bytes_read = recv(dmx->socket, buf, SIZE_OF_UNIVERSE, 0);
+    if (bytes_read != SIZE_OF_UNIVERSE) {
+      printf("Invalid packet of size %zd\n", bytes_read);
+      return;
+    }
+    //printf("Processing packet\n");
+    memcpy(dmx->universe+1, buf, SIZE_OF_UNIVERSE);
+    bytes_avail = recv(dmx->socket, buf, SIZE_OF_UNIVERSE, MSG_PEEK);
+    dmx->packet_count += 1;
+  }
+  
+}
 int main(void) {
   struct DmxOutput* dmx = NULL;
   printf("**********************  DMX Master 1.0 **********************\n");
@@ -146,14 +191,18 @@ int main(void) {
     printf("Failed to initialize dmx device");
     return EXIT_FAILURE;
   }
+  if (udp_setup(dmx) != 0){
+    return EXIT_FAILURE;
+  }
   printf("Timer init\n");
-	set_periodic_timer(DMX_FREQUENCY);
+	set_periodic_timer(DMX_INTERVAL);
   dmx->universe[1] = 255;
   while (TRUE) {
     if (dmx_check(dmx) == 0) {
       dmx_write_universe(dmx);
       dmx_report(dmx);
     }
+    udp_read(dmx);
     rk_sem_wait(&timer_sem);
   }
   dmx_cleanup(dmx);
